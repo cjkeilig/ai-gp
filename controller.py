@@ -86,7 +86,7 @@ CAMERA_FX_PX = 320.0
 
 HOVER_THRUST = 0.3
 HOVER_DURATION_S = 2.0
-CRUISE_THRUST = 0.3
+CRUISE_THRUST = 0.27
 
 # --------------------------------------------------------------------------------------
 # ROOT CAUSE (previous design): ACRO/rate control (ATTITUDE_IGNORE) has no self-leveling -
@@ -122,12 +122,12 @@ CRUISE_THRUST = 0.3
 # 0.0 forever - it likely avoided this exact failure mode by never sustaining the command.
 # Reproduce that shape (short pulse, forced rest) but repeat it periodically so pitch can
 # still be corrected over the course of the flight instead of being one-shot.
-TARGET_CRUISE_PITCH_RAD = -0.22
+TARGET_CRUISE_PITCH_RAD = -0.14
 K_P_PITCH_RATE_PER_RAD = 2.2
 MAX_PITCH_RATE_RADS = 1.0
 PITCH_DEADBAND_RAD = 0.05     # don't bother pulsing for errors smaller than this
-PITCH_PULSE_ON_S = 0.25       # max continuous duration of a nonzero pitch-rate command
-PITCH_PULSE_COOLDOWN_S = 0.75  # forced pitch_rate=0.0 for this long after a pulse ends
+PITCH_PULSE_ON_S = 0.18       # max continuous duration of a nonzero pitch-rate command
+PITCH_PULSE_COOLDOWN_S = 0.95  # forced pitch_rate=0.0 for this long after a pulse ends
 
 # Yaw: target heading is set once per *new* vision frame as
 # (current estimated heading + bearing angle to the detected gate), then held via P(D)
@@ -160,8 +160,12 @@ MIN_ROLL_YAW_GAIN_SCALE = 0.4
 # visible for a couple of ticks before leaving frame - too little time for a rate-based
 # pitch change to accumulate into a meaningful attitude/altitude change. Directly scaling
 # collective thrust gives immediate, decoupled vertical authority instead.
-# gate below center (cy_offset > 0) -> reduce thrust -> descend toward it.
+# gate below center (cy_offset > 0) -> reduce thrust -> descend toward it. Do not add
+# thrust when the gate is above center: near gate 1, partial/clipped detections can make the
+# box center jump high in the image, and climbing on that ambiguity sends the drone over the
+# gate instead of through it.
 K_P_THRUST_PER_PX = 0.0008       # thrust adjustment per pixel of vertical offset
+FAR_GATE_CLIMB_AREA_PX2 = 2500.0
 #
 # cy_offset alone was unreliable here: logs show it staying near-zero/negative even as the
 # gate's bounding box grows to fill most of the frame (i.e. right before reaching it), so the
@@ -169,7 +173,7 @@ K_P_THRUST_PER_PX = 0.0008       # thrust adjustment per pixel of vertical offse
 # needed. bbox area is unambiguous regardless of that - bigger box always means closer - so
 # use it to force a deliberate, monotonic descent bias as the gate looms larger, independent
 # of whatever cy_offset is doing.
-K_AREA_THRUST_DESCENT = 0.0000006  # thrust reduction per px^2 of bounding-box area
+K_AREA_THRUST_DESCENT = 0.0000012  # thrust reduction per px^2 of bounding-box area
 MIN_CRUISE_THRUST = 0.20
 MAX_CRUISE_THRUST = 0.45
 
@@ -217,6 +221,7 @@ class Controller:
     def __init__(self, sim_conn, data, system_boot_ms):
         self.sim_conn = sim_conn
         self.data = data
+        self.shared_data = data
         self.system_boot_ms = system_boot_ms
         self.flight_start_time = None
         self._last_arm_attempt = 0.0
@@ -233,6 +238,7 @@ class Controller:
         self._pitch_pulsing = False
         self._pitch_pulse_started_at = 0.0
         self._pitch_cooldown_until = 0.0
+        self._last_action_phase = "waiting"
 
     def update(self):
         if not self._requested_mode_info:
@@ -260,6 +266,7 @@ class Controller:
             self._pitch_cooldown_until = 0.0
             # Stream a neutral setpoint while waiting to arm, in case the sim needs an
             # active command stream present before it grants control.
+            self._log_action("waiting", 0.0, 0.0, 0.0, 0.0)
             update_attitude_flight_control(self.sim_conn, self.system_boot_ms, 0.0, 0.0, 0.0, 0.0)
             now = time.time()
             if now - self._last_arm_attempt >= ARM_RETRY_S:
@@ -279,6 +286,7 @@ class Controller:
         if self.flight_start_time is None:
             race_status = self.data.get('race_status')
             if race_status is None:
+                self._log_action("waiting", 0.0, 0.0, 0.0, 0.0)
                 update_attitude_flight_control(self.sim_conn, self.system_boot_ms, 0.0, 0.0, 0.0, 0.0)
                 time.sleep(1.0 / CONTROL_HZ)
                 return
@@ -292,6 +300,7 @@ class Controller:
 
             race_is_fresh = start_ms > 0 and start_ms >= self._wait_start_anchor_ms
             if not (race_is_fresh and sim_ms >= start_ms):
+                self._log_action("waiting", 0.0, 0.0, 0.0, 0.0)
                 update_attitude_flight_control(self.sim_conn, self.system_boot_ms, 0.0, 0.0, 0.0, 0.0)
                 time.sleep(1.0 / CONTROL_HZ)
                 return
@@ -302,12 +311,48 @@ class Controller:
         elapsed = time.time() - self.flight_start_time
 
         if elapsed < HOVER_DURATION_S:
+            self._log_action("hover", 0.0, 0.0, 0.0, HOVER_THRUST)
             update_attitude_flight_control(self.sim_conn, self.system_boot_ms, 0.0, 0.0, 0.0, HOVER_THRUST)
         else:
             roll_rate, pitch_rate, yaw_rate, thrust = self._vision_steering_correction()
+            self._log_action(self._last_action_phase, roll_rate, pitch_rate, yaw_rate, thrust)
             update_attitude_flight_control(self.sim_conn, self.system_boot_ms, roll_rate, pitch_rate, yaw_rate, thrust)
 
         time.sleep(1.0 / CONTROL_HZ)
+
+    def _log_action(
+        self,
+        phase: str,
+        roll_rate: float,
+        pitch_rate: float,
+        yaw_rate: float,
+        thrust: float,
+    ) -> None:
+        replay_logger = self.shared_data.get("replay_logger") if hasattr(self, "shared_data") else None
+
+        if replay_logger is None:
+            return
+
+        extra = {}
+        gate = self.data.get('vision_gate_estimate')
+        if gate is not None:
+            extra["vision_gate"] = {
+                "frame_id": gate.get("frame_id"),
+                "cx_offset": gate.get("cx_offset"),
+                "cy_offset": gate.get("cy_offset"),
+                "bbox_w": gate.get("bbox_w"),
+                "bbox_h": gate.get("bbox_h"),
+                "area": gate.get("area"),
+            }
+
+        replay_logger.log_action(
+            phase=phase,
+            roll_rate=roll_rate,
+            pitch_rate=pitch_rate,
+            yaw_rate=yaw_rate,
+            thrust=thrust,
+            extra=extra or None,
+        )
 
     # -------------------------------
     # Maintain a running roll/pitch/yaw estimate by integrating HIGHRES_IMU gyro rates each
@@ -399,6 +444,7 @@ class Controller:
         gyro = self.data.get('gyro') or {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0}
 
         if max(abs(gyro['roll']), abs(gyro['pitch']), abs(gyro['yaw'])) > TUMBLE_GYRO_THRESHOLD_RADS:
+            self._last_action_phase = "tumble_recovery"
             # Reset the estimator too - a stale/diverged estimate would otherwise keep pinning
             # the pitch-hold P term at saturation even once the tumble passes, since nothing
             # would shrink the error back down on its own.
@@ -419,6 +465,7 @@ class Controller:
                 )
             return 0.0, 0.0, 0.0, TUMBLE_RECOVERY_THRUST
 
+        self._last_action_phase = "vision"
         if gate is not None and gate['frame_id'] != self._prev_gate_frame_id:
             self._prev_gate_frame_id = gate['frame_id']
             # gate right of center (cx_offset > 0) -> positive bearing -> point the nose
@@ -453,9 +500,13 @@ class Controller:
         turn_thrust_ease = MAX_TURN_THRUST_EASE * turn_ease_scale
 
         if gate is not None:
+            cy_for_thrust = gate['cy_offset']
+            if gate['area'] >= FAR_GATE_CLIMB_AREA_PX2:
+                cy_for_thrust = max(cy_for_thrust, 0.0)
+
             thrust = (
                 CRUISE_THRUST
-                - K_P_THRUST_PER_PX * gate['cy_offset']
+                - K_P_THRUST_PER_PX * cy_for_thrust
                 - K_AREA_THRUST_DESCENT * gate['area']
                 - turn_thrust_ease
             )

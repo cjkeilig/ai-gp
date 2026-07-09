@@ -23,10 +23,16 @@ UPPER_RED_2 = np.array([180, 255, 255])
 # Minimum contour area (px^2) to be considered a real gate detection, not noise.
 MIN_CONTOUR_AREA = 800
 
+# Once the red frame is clipped by the image edge, its bounding-box center is no longer a
+# reliable bearing to a gate. This happens right as gate 1 passes overhead; using that sliver
+# as a fresh target can steer the drone away from the next gate.
+EDGE_CLIP_MARGIN_PX = 2
+
 class VisionRX:
 
     def __init__(self, data):
         self.data = data
+        self.shared_data = data
         self.thread = threading.Thread(
             target=self._vision_loop,
             daemon=False
@@ -92,6 +98,14 @@ class VisionRX:
                     del frames[frame_id]
                     continue
 
+                replay_logger = self.shared_data.get("replay_logger")
+                if replay_logger is not None:
+                    replay_logger.log_frame_jpeg(
+                        frame_id=frame_id,
+                        jpeg_bytes=jpeg_bytes,
+                        sim_time_ns=sim_time_ns,
+                    )
+
                 img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
                 image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 if image is not None:
@@ -143,6 +157,16 @@ class VisionRX:
 
         best = max(valid, key=cv2.contourArea)
         bx, by, bw, bh = cv2.boundingRect(best)
+        img_h, img_w = img.shape[:2]
+
+        if (
+            bx <= EDGE_CLIP_MARGIN_PX
+            or by <= EDGE_CLIP_MARGIN_PX
+            or bx + bw >= img_w - EDGE_CLIP_MARGIN_PX
+            or by + bh >= img_h - EDGE_CLIP_MARGIN_PX
+        ):
+            self.data['vision_gate_estimate'] = None
+            return
 
         # Bounding-box center rather than contour centroid - the gate is a hollow frame,
         # so the centroid of its contour falls inside the empty middle anyway for a
